@@ -64,7 +64,7 @@ except:
     
 try:
     from llama_cpp.llama_chat_format import (GLM46VChatHandler, LFM2VLChatHandler, GLM41VChatHandler)
-    chat_handlers += ["GLM-4.6V", "GLM-4.6V-Thinking", "GLM-4.1V-Thinking", "LFM2-VL"]
+    chat_handlers += ["GLM-4.6V", "GLM-4.6V-Thinking", "GLM-4.1V", "GLM-4.1V-Thinking", "LFM2-VL"]
 except:
     GLM46VChatHandler = None
     LFM2VLChatHandler = None
@@ -190,7 +190,7 @@ class LLAMA_CPP_STORAGE:
                     return Gemma4ChatHandler
                 case "GLM-4.6V"|"GLM-4.6V-Thinking":
                     return GLM46VChatHandler
-                case "GLM-4.1V-Thinking":
+                case "GLM-4.1V"|"GLM-4.1V-Thinking":
                     return GLM41VChatHandler
                 case "LFM2-VL":
                     return LFM2VLChatHandler
@@ -219,6 +219,14 @@ class LLAMA_CPP_STORAGE:
         image_max_tokens = config["image_max_tokens"]
         image_min_tokens = config["image_min_tokens"]
         n_gpu_layers = -1
+        cache_type_k = config.get("cache_type_k", "default")
+        cache_type_v = config.get("cache_type_v", "default")
+        user_n_gpu_layers = config.get("n_gpu_layers", -1)
+        n_cpu_moe = config.get("n_cpu_moe", 0)
+        n_seq_max = config.get("n_seq_max", 1)
+        
+        # Map cache type strings to ggml_type integers
+        kv_type_map = {"default": None, "f16": 1, "q8_0": 8, "q4_0": 2, "q5_0": 6}
         
         model_path = os.path.join(folder_paths.models_dir, 'LLM', model)
         handler = get_chat_handler(chat_handler)
@@ -239,14 +247,13 @@ class LLAMA_CPP_STORAGE:
             
             print(f"[llama-cpp_vlm] Loading clip:  {mmproj}")
             
-            think_mode = "Thinking" in chat_handler
-            kwargs = {"clip_model_path": mmproj_path, "verbose": False}
+            kwargs = {"mmproj_path": mmproj_path, "verbose": False}
             if chat_handler in ["Qwen3-VL", "Qwen3-VL-Thinking"]:
-                kwargs["force_reasoning"] = think_mode
+                kwargs["force_reasoning"] = config.get("enable_thinking", "Thinking" in chat_handler)
                 kwargs["image_max_tokens"] = image_max_tokens
                 kwargs["image_min_tokens"] = image_min_tokens
-            elif chat_handler in ["MiniCPM-v4.5", "GLM-4.6V", "Qwen3.5"]:
-                kwargs["enable_thinking"] = think_mode
+            else:
+                kwargs["enable_thinking"] = config.get("enable_thinking", "Thinking" in chat_handler)
 
             if _MTMD:
                 kwargs["image_max_tokens"] = image_max_tokens
@@ -265,9 +272,24 @@ class LLAMA_CPP_STORAGE:
             else:
                 cls.chat_handler = None
         
+        # Override with user-specified GPU layers if explicitly set (>= 0)
+        if user_n_gpu_layers >= 0:
+            n_gpu_layers = user_n_gpu_layers
+        
         print(f"[llama-cpp_vlm] Loading model: {model}")
         print(f"[llama-cpp_vlm] n_gpu_layers = {n_gpu_layers}")
-        cls.llm = Llama(model_path, chat_handler=cls.chat_handler, n_gpu_layers=n_gpu_layers, n_ctx=n_ctx, verbose=False)
+        print(f"[llama-cpp_vlm] cache_type_k = {cache_type_k}, cache_type_v = {cache_type_v}, n_cpu_moe = {n_cpu_moe}, n_seq_max = {n_seq_max}")
+        cls.llm = Llama(
+            model_path,
+            chat_handler=cls.chat_handler,
+            n_gpu_layers=n_gpu_layers,
+            n_ctx=n_ctx,
+            n_seq_max=n_seq_max,
+            n_cpu_moe=n_cpu_moe,
+            type_k=kv_type_map[cache_type_k],
+            type_v=kv_type_map[cache_type_v],
+            verbose=False
+        )
 
 any_type = AnyType("*")
 
@@ -393,6 +415,30 @@ class llama_cpp_model_loader:
             }),
             "image_min_tokens": ("INT", {"default": 0, "min": 0, "max": 4096, "step": 32}),
             "image_max_tokens": ("INT", {"default": 0, "min": 0, "max": 4096, "step": 32}),
+            "n_gpu_layers": ("INT", {
+                "default": -1, "min": -1, "max": 1024, "step": 1,
+                "tooltip": "GPU layers (-1 = auto/use all). Overrides vram_limit calculation when manually set."
+            }),
+            "cache_type_k": (["default", "f16", "q8_0", "q4_0", "q5_0"], {
+                "default": "default",
+                "tooltip": "KV cache K quantization (--cache-type-k). q8_0 recommended for MoE models."
+            }),
+            "cache_type_v": (["default", "f16", "q8_0", "q4_0", "q5_0"], {
+                "default": "default",
+                "tooltip": "KV cache V quantization (--cache-type-v). q8_0 recommended for MoE models."
+            }),
+            "n_cpu_moe": ("INT", {
+                "default": 0, "min": 0, "max": 512, "step": 1,
+                "tooltip": "Keep MoE expert weights of first N layers on CPU (0 = no restriction).\nFor Qwen3.6-35B, try 34 to save VRAM."
+            }),
+            "n_seq_max": ("INT", {
+                "default": 1, "min": 1, "max": 32, "step": 1,
+                "tooltip": "Max parallel sequences (--parallel). Increase for batched VLM."
+            }),
+            "enable_thinking": ("BOOLEAN", {
+                "default": False,
+                "tooltip": "Enable thinking/reasoning mode. Disable for clean output without <think> tags."
+            }),
             }
         }
 
@@ -408,6 +454,7 @@ class llama_cpp_model_loader:
             return float("NaN") 
         
         custom_config = {
+            "enable_thinking": enable_thinking,
             "model": model,
             "mmproj": mmproj,
             "chat_handler":chat_handler,
@@ -419,7 +466,7 @@ class llama_cpp_model_loader:
         config_str = json.dumps(custom_config, sort_keys=True, ensure_ascii=False)
         return config_str
     '''
-    def loadmodel(self, model, mmproj, chat_handler, n_ctx, vram_limit, image_min_tokens, image_max_tokens):
+    def loadmodel(self, model, mmproj, chat_handler, n_ctx, vram_limit, image_min_tokens, image_max_tokens, n_gpu_layers, cache_type_k, cache_type_v, n_cpu_moe, n_seq_max, enable_thinking):
         custom_config = {
             "model": model,
             "mmproj": mmproj,
@@ -427,7 +474,12 @@ class llama_cpp_model_loader:
             "n_ctx": n_ctx,
             "vram_limit": vram_limit,
             "image_min_tokens": image_min_tokens,
-            "image_max_tokens": image_max_tokens
+            "image_max_tokens": image_max_tokens,
+            "n_gpu_layers": n_gpu_layers,
+            "cache_type_k": cache_type_k,
+            "cache_type_v": cache_type_v,
+            "n_cpu_moe": n_cpu_moe,
+            "n_seq_max": n_seq_max,
         }
         if not LLAMA_CPP_STORAGE.llm or LLAMA_CPP_STORAGE.current_config != custom_config:
             print("[llama-cpp_vlm] Loading model...")
@@ -543,7 +595,7 @@ class llama_cpp_instruct_adv:
             user_content.append({"type": "text", "text": p})
             
         if images is not None:
-            if not hasattr(LLAMA_CPP_STORAGE.chat_handler, "clip_model_path") or LLAMA_CPP_STORAGE.chat_handler.clip_model_path is None:
+            if not hasattr(LLAMA_CPP_STORAGE.chat_handler, "mmproj_path") or LLAMA_CPP_STORAGE.chat_handler.mmproj_path is None:
                  raise ValueError("Image input detected, but the loaded model is not configured with a mmproj module.")
                 
             frames = images
